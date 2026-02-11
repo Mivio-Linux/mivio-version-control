@@ -1,0 +1,5 @@
+/target
+Cargo.lock
+foo.tar
+.mvc
+.mvcignore
