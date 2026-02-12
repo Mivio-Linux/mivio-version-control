@@ -1,7 +1,8 @@
 
-use std::{fs, io::{self, Read, Write}};
+use std::{fs, io::{self, Read, Write}, path::Path};
 use serde_json::{Value};
 use tar::{Builder, Archive};
+use colored::Colorize;
 use serde::{Deserialize, Serialize};
 use sha2::{Sha256, Digest};
 
@@ -35,7 +36,27 @@ fn calculate_hash(path: &str) -> Result<String, std::io::Error>  {
     io::copy(&mut file, &mut hasher)?; // копируем контент из file в hasher
     Ok(format!("{:x}", hasher.finalize())) // возвращаеем форматируя как строку и заканчивая хеш
 }
+///
+fn is_ignore(path: &Path, ignore_list: &[&str]) -> bool{
+    if !path.is_absolute() { // если путь не абсолютный
+        let ancestors = path.ancestors(); // Создает итератор по объекту Path и его предкам.
+        for ancetor in ancestors { // берем все элементы
+            let ancetor_string: &str; // создаем переменную в которой будет хранится путь в виде строки
+            ancetor_string = ancetor.to_str().unwrap_or_else(|| {
+                std::process::exit(1)
+            });
+            if ignore_list.contains(&ancetor_string.strip_prefix("./").expect("123123")){ // если в игнор листе будет наш путь
+                return true; // то возвращаем true (да, игнорировать)
+            }
+            
+        }
+    } else {
+        return true; // если путь будет абсолютным то есть риск удалить системные файлы, поэтому лучше будет игнорить
+    }
+    return false; // ну а если вапще чета как та и не то и не другое то false
+}
 
+/// Проверяет в репозитории ли мы
 fn is_in_repo() -> Result<bool, io::Error> {
     let folder = fs::exists(".mvc");
     folder
@@ -43,39 +64,31 @@ fn is_in_repo() -> Result<bool, io::Error> {
 /// Получение ignorelist'а
 fn get_ignore() -> Result<String, io::Error> {
     if !is_in_repo()? {
-        println!("[ERROR] Not in repo");
-        return Err(io::Error::new(io::ErrorKind::Other, "Not in repo"));
+        return Err(io::Error::new(io::ErrorKind::NotFound, "Not in repo"));
     }
     let ignore = fs::read_to_string(IGNORE_FILE);
     ignore
-    /*.unwrap_or_else(|e| {
-        eprintln!("[ERROR] cant read ignorelist! {}",e);
-        let mut ignore = fs::File::create(IGNORE_FILE).unwrap();
-        ignore.write(STANDARD_IGNORE.as_bytes()).unwrap_or(0);
-        drop(ignore);
-        STANDARD_IGNORE.to_string()
-    }); */
 }
 /// удаляет все то что не в игнор листе
 fn delete_current() -> Result<(), std::io::Error>  {
-    let current_dir = fs::read_dir(".")?; // читаем текущую директорию
+    let current_dir = walkdir::WalkDir::new(".").min_depth(1); // читаем текущую директорию
     let ignore = get_ignore(); // получаем ignorelist
     let ignore: String = ignore?;
     let splited_ignore: Vec<&str> = ignore.split("\n").collect(); //разделяем на строки
+    
     for x in current_dir {
-        //x?.file_name().to_str().unwrap_or("none")
-        let y = &mut x?; 
-        if !splited_ignore.iter().any(|f| *f==y.file_name().as_os_str()) {  //если не в игнор листе
+        let y = x?; 
+        if !is_ignore(y.path(), &splited_ignore) {
             if y.metadata().unwrap().is_dir() {
-                fs::remove_dir_all(y.file_name())?;
+                fs::remove_dir_all(y.path())?;
             } else {
-                fs::remove_file(y.file_name())?;
+                fs::remove_file(y.path())?;
             }
-            //x.to_str().unwrap_or("").to_string()
         }
     }
     Ok(())
 }
+
 /// Функция создающая архив с кодом
 fn create_archive(file: fs::File) -> Result<(), std::io::Error> {
     let ignore = get_ignore(); // получаем ignorelist
@@ -116,39 +129,32 @@ fn create_snap(snap_id: u32, message: &str) -> Result<(), std::io::Error> {
 /// Иницилизация нового репозитория
 fn init() -> Result<(), std::io::Error> {
     if is_in_repo()? {
-        eprintln!("[WARNING] The repository has already been initialized.")
+        return Err(io::Error::new(io::ErrorKind::AlreadyExists, "The repository has already been initialized."));
     } else {
         fs::create_dir_all(SNAP_ARCHIVE_PATH)?;  // } создаем папки
         fs::create_dir_all(SNAP_METADATA_PATH)?; // }
         let mut ignore = fs::File::create(IGNORE_FILE)?; // создаем ignore list
         ignore.write(STANDARD_IGNORE.as_bytes())?; // записываем его
-        drop(ignore); // дропаем переменную
-        println!("[LOG] Created directories and ignore file"); 
-        create_snap(1 , "Initial")?; // создаем снапшот
-        println!("[LOG] Created snapshot");
+        // create_snap(1 , "Initial")?; // создаем снапшот
         let mut head = fs::File::create(".mvc/HEAD")?;
-        head.write("1".as_bytes())?;
+        head.write("0".as_bytes())?;
+        println!("Repository initialized! Please execute \"mvc save Initial\" for create first commit!");
     }
     Ok(())
 }
 /// распаковка архива с данными по id
 fn unpack_arch(id: &u32) -> Result<(), std::io::Error> {
-
     delete_current()?;
     let path = format!("{}/{}.tar", SNAP_ARCHIVE_PATH, id);
     let file = fs::File::open(path)?;
     let mut archive = Archive::new(file);
-
-
-
     archive.unpack(".")?;
     Ok(())
 }
 /// Функция для возврата к снапшоту
 fn return_to_snap(id: u32) -> Result<(), std::io::Error> {
     if !is_in_repo()? {
-        println!("[ERROR] Not in repo");
-        std::process::exit(1)
+        return Err(io::Error::new(io::ErrorKind::NotFound, "Not in repo"));
     }
     let new_hash = calculate_hash(&format!("{}/{}.tar", SNAP_ARCHIVE_PATH, id))?;
 
@@ -161,10 +167,8 @@ fn return_to_snap(id: u32) -> Result<(), std::io::Error> {
         eprintln!("[ERROR] Hashs not match");
         return Err(std::io::Error::new(io::ErrorKind::Other, "Hashs not match"))
     }
-    print!("[LOG] Hashes matched!");
     // распаковываем архив...
     unpack_arch(&id)?;
-
     // выводим всю инфу:
     println!("Message: {}", metadata["message"]);
     Ok(())
@@ -172,8 +176,7 @@ fn return_to_snap(id: u32) -> Result<(), std::io::Error> {
 /// Функция для того чтобы цифарки обновить снапшота и тд
 fn save_snap(message: &str) -> Result<(), std::io::Error> {
     if !is_in_repo()? {
-        println!("[ERROR] Not in repo");
-        std::process::exit(1)
+        return Err(io::Error::new(io::ErrorKind::NotFound, "Not in repo"));
     }
     let last_snap_str = fs::read_to_string(".mvc/HEAD")?;
     let last_snap_int: u32 = last_snap_str.parse().unwrap_or_else(|e| {
@@ -190,8 +193,7 @@ fn save_snap(message: &str) -> Result<(), std::io::Error> {
 /// Вывод всех снапшотов с их инфой
 fn read_all_snaps() -> Result<(), std::io::Error> {
     if !is_in_repo()? {
-        println!("[ERROR] Not in repo");
-        std::process::exit(1)
+        return Err(io::Error::new(io::ErrorKind::NotFound, "Not in repo"));
     }
     if let Ok(entries) = fs::read_dir(SNAP_METADATA_PATH) {
         for entry in entries {
@@ -205,34 +207,29 @@ fn read_all_snaps() -> Result<(), std::io::Error> {
 Hash: {}
 Message: {}
 ----", file_name.to_str().unwrap_or("ERROR").replace(".json", ""), value["hash"], value["message"]);
-
         }
     }
     Ok(())
 }
-fn main() -> Result<(), std::io::Error>  {
+/// основная функция.
+fn run() -> Result<(), std::io::Error>  {
+    
     let args: Vec<String> = std::env::args().collect();
-    let version = || {
-        println!("{} version {}. Protected by the MIT license", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"))
-    };
-    let usage = || {
-        println!("
-Usage:
+    let version = || {println!("{}  v{}. Protected by the MIT license", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"))};
+    let usage = || {println!(
+"Usage:
     mvc [-v | --version] <command> [<args>]
 Commands:
     init              - initialize a new repository
     log               - print all snapshots
     return <id>       - returns to <id> version
     save <message>    - saves version
-    help              - show this message")
-    };
-    // let _ = create_archive(file, "ignore.txt");
-    //init().unwrap();
+    help              - show this message")};
     if args.len() == 2 {
         if args[1] == "init" {
-            init()?
+            init()?;
         } else if args[1] == "log" {
-            read_all_snaps()?
+            read_all_snaps()?;
         } else if args[1] == "--version" || args[1] == "-v"{
             version()
         } else{usage()}
@@ -240,16 +237,14 @@ Commands:
         if args[1] == "return" {
             return_to_snap(args[2].parse().unwrap())?;
         } else if args[1] == "save" {
-            let mut message= String::new();
-            for arg in &args[2..] {
-                let arg_format = format!("{} ",arg);
-                message.push_str(&arg_format);
-            }
-            save_snap(&message)?;   
-        } else {
-            usage()
-        } 
+            save_snap(&args[2..].join(" "))?;   
+        } else {usage()} 
     } else {usage()}
-    
     Ok(())
+}
+fn main() {
+    if let Err(e) = run() {
+        eprintln!("[{}] {}","ERROR".red(), e);
+        std::process::exit(1);
+    }
 }
