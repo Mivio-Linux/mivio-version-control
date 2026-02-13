@@ -36,28 +36,27 @@ fn calculate_hash(path: &str) -> Result<String, std::io::Error>  {
     io::copy(&mut file, &mut hasher)?; // копируем контент из file в hasher
     Ok(format!("{:x}", hasher.finalize())) // возвращаеем форматируя как строку и заканчивая хеш
 }
-///
-fn is_ignore(path: &Path, ignore_list: &[&str]) -> bool{
+/// проверяет, надо ли игнорировать путь
+fn should_ignore(path: &Path, ignore_list: &[&str]) -> bool{
     if !path.is_absolute() { // если путь не абсолютный
         let ancestors = path.ancestors(); // Создает итератор по объекту Path и его предкам.
-        for ancetor in ancestors { // берем все элементы
-            let ancetor_string: &str; // создаем переменную в которой будет хранится путь в виде строки
-            ancetor_string = ancetor.to_str().unwrap_or_else(|| {
-                std::process::exit(1)
-            });
+        
+        for ancestor in ancestors { // берем все элементы
+            if &ancestor == &Path::new(".") {return true;} // если путь это . (текущая директория) то игнорируй
+            // let ancestor = ancestor.strip_prefix("./").unwrap();
             if ignore_list.iter().any(|ignore| {
-              format!("./{}",ignore) == ancetor_string
-            }){ // если в игнор листе будет наш путь
+                //println!("{} == {}: {}", *ignore, ancestor.as_os_str().to_str().unwrap(), Some(*ignore) == ancestor.as_os_str().to_str());
+                let ignore_path = Some(*ignore) == ancestor.as_os_str().to_str();// если в игнор листе будет наш путь
+                return ignore_path;  
+            }){
                 return true; // то возвращаем true (да, игнорировать)
             }
-            
         }
     } else {
         return true; // если путь будет абсолютным то есть риск удалить системные файлы, поэтому лучше будет игнорить
     }
     return false; // ну а если вапще чета как та и не то и не другое то false
 }
-
 /// Проверяет в репозитории ли мы
 fn is_in_repo() -> Result<bool, io::Error> {
     let folder = fs::exists(".mvc");
@@ -72,25 +71,27 @@ fn get_ignore() -> Result<String, io::Error> {
     ignore
 }
 /// удаляет все то что не в игнор листе
-fn delete_current() -> Result<(), std::io::Error>  {
-    let current_dir = walkdir::WalkDir::new(".").min_depth(1); // читаем текущую директорию
+fn delete_current(path: &Path) -> Result<(), std::io::Error>  {
+    let current_dir = walkdir::WalkDir::new(path).min_depth(1).contents_first(true); // читаем текущую директорию
     let ignore = get_ignore(); // получаем ignorelist
     let ignore: String = ignore?;
     let splited_ignore: Vec<&str> = ignore.split("\n").collect(); //разделяем на строки
     
-    for x in current_dir {
-        let y = x?; 
-        if !is_ignore(y.path(), &splited_ignore) {
-            if y.metadata().unwrap().is_dir() {
-                fs::remove_dir_all(y.path())?;
+    for entry in current_dir {
+        
+        let borrowed_entry = entry?; 
+        let should_ignore = !should_ignore(borrowed_entry.path().strip_prefix("./").unwrap(), &splited_ignore);
+        //println!("DELETECURRENT y: {}: {}", y.path().strip_prefix("./").unwrap().display(), z);
+        if should_ignore {
+            if borrowed_entry.metadata().unwrap().is_dir() {
+                delete_current(borrowed_entry.path())?;
             } else {
-                fs::remove_file(y.path())?;
+                fs::remove_file(borrowed_entry.path())?;
             }
         }
     }
     Ok(())
 }
-
 /// Функция создающая архив с кодом
 fn create_archive(file: fs::File) -> Result<(), std::io::Error> {
     let ignore = get_ignore(); // получаем ignorelist
@@ -109,7 +110,6 @@ fn create_archive(file: fs::File) -> Result<(), std::io::Error> {
             else { 
                 archive.append_path(object_name).unwrap(); // просто заархивируй
             }
-            
         }
     }
     Ok(())
@@ -146,7 +146,7 @@ fn init() -> Result<(), std::io::Error> {
 }
 /// распаковка архива с данными по id
 fn unpack_arch(id: &u32) -> Result<(), std::io::Error> {
-    delete_current()?;
+    delete_current(&Path::new("."))?;
     let path = format!("{}/{}.tar", SNAP_ARCHIVE_PATH, id);
     let file = fs::File::open(path)?;
     let mut archive = Archive::new(file);
@@ -159,14 +159,12 @@ fn return_to_snap(id: u32) -> Result<(), std::io::Error> {
         return Err(io::Error::new(io::ErrorKind::NotFound, "Not in repo"));
     }
     let new_hash = calculate_hash(&format!("{}/{}.tar", SNAP_ARCHIVE_PATH, id))?;
-
     // получаем его метаданные
     let mut metadata: String = String::new();
     let mut metadata_file = fs::File::open(format!("{}/{}.json", SNAP_METADATA_PATH, id))?;
     metadata_file.read_to_string(&mut metadata)?;
     let metadata: Value = serde_json::from_str(&metadata)?;
     if metadata["hash"].as_str().unwrap() != new_hash {
-        eprintln!("[ERROR] Hashs not match");
         return Err(std::io::Error::new(io::ErrorKind::Other, "Hashs not match"))
     }
     // распаковываем архив...
@@ -182,7 +180,7 @@ fn save_snap(message: &str) -> Result<(), std::io::Error> {
     }
     let last_snap_str = fs::read_to_string(".mvc/HEAD")?;
     let last_snap_int: u32 = last_snap_str.parse().unwrap_or_else(|e| {
-        eprintln!("[ERROR] cant str -> int, {}",e);
+        eprintln!("[{}] cant str -> int, {}", "ERROR".red(),e);
         std::process::exit(1);
     });
     let last_snap_int = last_snap_int + 1;
@@ -197,33 +195,36 @@ fn read_all_snaps() -> Result<(), std::io::Error> {
     if !is_in_repo()? {
         return Err(io::Error::new(io::ErrorKind::NotFound, "Not in repo"));
     }
-    if let Ok(entries) = fs::read_dir(SNAP_METADATA_PATH) {
-        for entry in entries {
-            let file = entry?;
-            let file_name = file.file_name();
-            let file_path = file.path();
-            let file = fs::read(file_path)?;
-            let content = String::from_utf8_lossy(&file);
-            let value: Value = serde_json::from_str(&content)?;
-            println!("Snapshot ID: {}
-Hash: {}
-Message: {}
-----", file_name.to_str().unwrap_or("ERROR").replace(".json", ""), value["hash"], value["message"]);
+    let mut paths: Vec<_> = fs::read_dir(SNAP_METADATA_PATH).unwrap()
+        .map(|r| r.unwrap())
+        .collect();
+    paths.sort_by_key(|path| path.path());
+
+    for path in paths {
+        let file_name = path.file_name();
+        let file = fs::read_to_string(path.path())?;
+        let file = file.as_str();
+        let value: Value = serde_json::from_str(file)?;
+        let pretty_name = file_name.to_str().unwrap_or("ERROR").replace(".json", "");
+        println!("{}: {}
+{}:        {}
+Message:     {}
+----", "Snapshot ID".bright_cyan(), pretty_name,"Hash".bright_purple(), value["hash"], value["message"]);
         }
-    }
+    
     Ok(())
 }
 /// основная функция.
 fn run() -> Result<(), std::io::Error>  {
     
     let args: Vec<String> = std::env::args().collect();
-    let version = || {println!("{}  v{}. Protected by the MIT license", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"))};
+    let version = || {println!("{} v{}. Licensed under MIT license", env!("CARGO_PKG_NAME").bright_green(), env!("CARGO_PKG_VERSION"))};
     let usage = || {println!(
 "Usage:
     mvc [-v | --version] <command> [<args>]
 Commands:
     init              - initialize a new repository
-    log               - print all snapshots
+    log               - display all snapshots
     return <id>       - returns to <id> version
     save <message>    - saves version
     help              - show this message")};
@@ -245,8 +246,8 @@ Commands:
     Ok(())
 }
 fn main() {
-    if let Err(e) = run() {
-        eprintln!("[{}] {}","ERROR".red(), e);
-        std::process::exit(1);
+    if let Err(e) = run() { // если Err(e) [(e это io::Error)] будет равен вызванной функции run()
+        eprintln!("[{}] {}","ERROR".red(), e); // то выведи e (ошибку)
+        std::process::exit(1); // и заверши выполнение с кодом 1
     }
 }
