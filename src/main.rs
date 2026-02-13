@@ -45,7 +45,9 @@ fn is_ignore(path: &Path, ignore_list: &[&str]) -> bool{
             ancetor_string = ancetor.to_str().unwrap_or_else(|| {
                 std::process::exit(1)
             });
-            if ignore_list.contains(&ancetor_string.strip_prefix("./").expect("123123")){ // если в игнор листе будет наш путь
+            if ignore_list.iter().any(|ignore| {
+              format!("./{}",ignore) == ancetor_string
+            }){ // если в игнор листе будет наш путь
                 return true; // то возвращаем true (да, игнорировать)
             }
             
