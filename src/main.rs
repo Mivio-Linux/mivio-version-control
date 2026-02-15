@@ -1,5 +1,5 @@
 
-use std::{fs, io::{self, Read, Write}, path::Path};
+use std::{env, fs, io::{self, Read, Write}, path::{Path}};
 use serde_json::{Value};
 use tar::{Builder, Archive};
 use colored::Colorize;
@@ -17,14 +17,37 @@ foo.tar
 .mvcignore";
 const SNAP_METADATA_PATH: &str = ".mvc/metadata";
 const SNAP_ARCHIVE_PATH: &str = ".mvc/archives";
-
+const USER_INFO_DIR: &str = ".muc";
+const USER_INFO_FILE: &str = "user.json";
+const USER_INFOS: [&str;2] = ["email", "name"];
   //            //
  // STRUCTURES //
 //            //
 #[derive(Serialize, Deserialize)]
 struct Snapshot {
     hash: String,
-    message: String
+    message: String,
+    email: String,
+    name: String,
+}
+#[derive(Serialize, Deserialize, Debug)]
+struct User {
+    email: String,
+    name: String,
+}
+  //                 //
+ // IMPLEMENTATIONS //
+//                 //
+impl User {
+    // fn new(name: &str, email: &str) -> User {
+    //     User {email: email.to_string(), name: name.to_string()}
+    // }
+    fn new_from_name(name:&str) -> User {
+        User { email: "None".to_string(), name: name.to_string()}
+    }
+    fn new_from_email(email:&str) -> User {
+        User { email: email.to_string(), name: "None".to_string() }
+    }
 }
   //           //
  // FUNCTIONS //
@@ -35,6 +58,78 @@ fn calculate_hash(path: &str) -> Result<String, std::io::Error>  {
     let mut hasher = Sha256::new(); // создаем хешер
     io::copy(&mut file, &mut hasher)?; // копируем контент из file в hasher
     Ok(format!("{:x}", hasher.finalize())) // возвращаеем форматируя как строку и заканчивая хеш
+}
+/// проверяет, заполнена ли инфа о пользователе (email, username)
+fn is_user_info() -> bool {
+    if let Some(home) = std::env::home_dir() {
+        println!("{}", home.display());
+        let full_path = home.join(USER_INFO_DIR).join(USER_INFO_FILE);
+        if full_path.exists() {
+            return true;
+        } else {
+            return false;
+        }
+    }
+    false
+}
+/// Меняем данные пользователя.
+fn config_user(target:&str, data: &str) -> Result<(), io::Error> {
+    println!("{target}");
+    if is_user_info() {
+        if let Some(home) = std::env::home_dir() {
+            let path = home.join(USER_INFO_DIR).join(USER_INFO_FILE);
+            let file = fs::read_to_string(&path)?;
+            let mut value: Value = serde_json::from_str(&file)?;
+            if USER_INFOS.contains(&target) {
+                value[target] = Value::String(data.to_string());
+                fs::write(path, serde_json::to_string(&value)?)?;
+            } else {
+                return Err(io::Error::new(io::ErrorKind::InvalidInput,format!("invalid parameter {target}, available: {:?}", USER_INFOS)))
+            }
+        }
+    } else {
+        if let Some(home) = std::env::home_dir() {
+            let path = home.join(USER_INFO_DIR);
+            fs::create_dir_all(&path)?;
+            fs::File::create(&path.join(USER_INFO_FILE))?;
+            if target == "name" {
+                let user = User::new_from_name(data);
+                let json_format: String = serde_json::to_string(&user)?;
+                let mut info = fs::File::create(&path.join(USER_INFO_FILE))?;
+                info.write(json_format.as_bytes())?;
+            } else if target == "email" {
+                let user = User::new_from_email(data);
+                let json_format: String = serde_json::to_string(&user)?;
+                let mut info = fs::File::create(&path.join(USER_INFO_FILE))?;
+                info.write(json_format.as_bytes())?;
+            }
+            
+        }
+    }
+    Ok(())
+}
+/// получение данных пользователя
+fn get_user() -> Result<User, io::Error>{
+    let path = env::home_dir().ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "Unable to find home directory"))?.join(USER_INFO_DIR).join(USER_INFO_FILE);
+    if is_user_info() {
+        println!("{}", path.display());
+        let file = fs::read_to_string(path)?;
+        let value: Value = serde_json::from_str(&file)?;
+        let email = value["email"].as_str().ok_or_else(||io::Error::new(io::ErrorKind::Other, // преобразуем option в result
+            format!("[{}] Failed to convert serde_json::Value::String to &str", "ERROR".red())))?.to_string(); // ашибка (текст)
+        let name = value["name"].as_str().ok_or_else(||io::Error::new(io::ErrorKind::Other,
+            format!("[{}] Failed to convert serde_json::Value::String to &str", "ERROR".red())))?.to_string();
+        let usr = User {
+            email: email,
+            name: name
+        };
+        println!("{:?}", &usr);
+        Ok(usr)
+    } else {
+        Err(io::Error::new(io::ErrorKind::NotFound, format!("No user information found. Search path: {}\ntry execute:
+    mvc cfg email your@email
+    mvc cfg name your_name", path.display())))
+    }
 }
 /// проверяет, надо ли игнорировать путь
 fn should_ignore(path: &Path, ignore_list: &[&str]) -> bool{
@@ -80,10 +175,13 @@ fn delete_current(path: &Path) -> Result<(), std::io::Error>  {
     for entry in current_dir {
         
         let borrowed_entry = entry?; 
-        let should_ignore = !should_ignore(borrowed_entry.path().strip_prefix("./").unwrap(), &splited_ignore);
+        let should_ignore = !should_ignore(borrowed_entry.path().strip_prefix("./").unwrap_or_else(|e|{
+            eprintln!("[{}] {e}", "ERROR".red());
+            Path::new(borrowed_entry.path())
+        }), &splited_ignore);
         //println!("DELETECURRENT y: {}: {}", y.path().strip_prefix("./").unwrap().display(), z);
         if should_ignore {
-            if borrowed_entry.metadata().unwrap().is_dir() {
+            if borrowed_entry.metadata()?.is_dir() {
                 delete_current(borrowed_entry.path())?;
             } else {
                 fs::remove_file(borrowed_entry.path())?;
@@ -100,15 +198,15 @@ fn create_archive(file: fs::File) -> Result<(), std::io::Error> {
     // let mut objects: Vec<String> = vec![];
     let mut archive = Builder::new(file); // Создаем архив в файле
     let current_dir = fs::read_dir("."); // читаем текущую строку
-    for object in current_dir.unwrap() {
+    for object in current_dir? {
         let object = object?; // берем объект
         let object_name = object.file_name(); // берем имя в виде строки
         if !splited_ignore.iter().any(|f| *f==object_name.as_os_str()) { // если строка ignore != файл то
-            if object.metadata().unwrap().is_dir() { //проверь директория ли это
-                archive.append_dir_all(&object_name, &object_name).unwrap(); // и заархивируй ее с дочерними элементами
+            if object.metadata()?.is_dir() { //проверь директория ли это
+                archive.append_dir_all(&object_name, &object_name)?; // и заархивируй ее с дочерними элементами
             }
             else { 
-                archive.append_path(object_name).unwrap(); // просто заархивируй
+                archive.append_path(object_name)?; // просто заархивируй
             }
         }
     }
@@ -118,12 +216,16 @@ fn create_archive(file: fs::File) -> Result<(), std::io::Error> {
 fn create_snap(snap_id: u32, message: &str) -> Result<(), std::io::Error> {
     create_archive(fs::File::create(format!("{}/{}.tar", SNAP_ARCHIVE_PATH, snap_id))?)?;
     let hash = calculate_hash(&format!("{}/{}.tar", SNAP_ARCHIVE_PATH, snap_id))?;
+    let user = get_user()?;
     let snapshot = Snapshot{
         hash: hash.to_string(),
-        message: message.to_string()
+        message: message.to_string(),
+        email: user.email,
+        name: user.name
     };
+    
 
-    let json_format: String = serde_json::to_string(&snapshot).unwrap();
+    let json_format: String = serde_json::to_string(&snapshot)?;
     let mut info = fs::File::create(format!("{}/{}.json", SNAP_METADATA_PATH, snap_id))?;
     info.write(json_format.as_bytes())?;
     Ok(())
@@ -164,29 +266,37 @@ fn return_to_snap(id: u32) -> Result<(), std::io::Error> {
     let mut metadata_file = fs::File::open(format!("{}/{}.json", SNAP_METADATA_PATH, id))?;
     metadata_file.read_to_string(&mut metadata)?;
     let metadata: Value = serde_json::from_str(&metadata)?;
-    if metadata["hash"].as_str().unwrap() != new_hash {
+    if metadata["hash"].as_str().ok_or_else(||io::Error::new(io::ErrorKind::Other, 
+            format!("[{}] Failed to convert serde_json::Value::String to &str", "ERROR".red())))?.to_string() != new_hash {
         return Err(std::io::Error::new(io::ErrorKind::Other, "Hashs not match"))
     }
     // распаковываем архив...
     unpack_arch(&id)?;
-    // выводим всю инфу:
+    // выводим сообщение:
     println!("Message: {}", metadata["message"]);
     Ok(())
+}
+/// Парсим последний коммит
+fn parse_last_snap_id() -> Result<u32, io::Error> {
+    let head_content = fs::read_to_string(".mvc/HEAD")?; // читаем head
+    let head_massive: Vec<&str> = head_content.split("\n").collect(); // разделяем на строки
+    let last_snap_str = head_massive[0]; // берем первую строку (номер послед. коммита)
+    let last_snap_int: u32 = last_snap_str.parse().unwrap_or_else(|e| {
+        println!("[{}] cant str -> int, {}", "ERROR".red(),e);
+        std::process::exit(1);
+    });
+    return Ok(last_snap_int);
 }
 /// Функция для того чтобы цифарки обновить снапшота и тд
 fn save_snap(message: &str) -> Result<(), std::io::Error> {
     if !is_in_repo()? {
         return Err(io::Error::new(io::ErrorKind::NotFound, "Not in repo"));
     }
-    let last_snap_str = fs::read_to_string(".mvc/HEAD")?;
-    let last_snap_int: u32 = last_snap_str.parse().unwrap_or_else(|e| {
-        eprintln!("[{}] cant str -> int, {}", "ERROR".red(),e);
-        std::process::exit(1);
-    });
-    let last_snap_int = last_snap_int + 1;
+    let last_snap = parse_last_snap_id()?;
+    let last_snap = last_snap + 1;
     
-    create_snap(last_snap_int, message)?;
-    fs::write(".mvc/HEAD", last_snap_int.to_string())?;
+    create_snap(last_snap, message)?;
+    fs::write(".mvc/HEAD", last_snap.to_string())?;
     println!("Saved!");
     Ok(())
 }
@@ -195,39 +305,40 @@ fn read_all_snaps() -> Result<(), std::io::Error> {
     if !is_in_repo()? {
         return Err(io::Error::new(io::ErrorKind::NotFound, "Not in repo"));
     }
-    let mut paths: Vec<_> = fs::read_dir(SNAP_METADATA_PATH).unwrap()
-        .map(|r| r.unwrap())
+    let mut paths: Vec<_> = fs::read_dir(SNAP_METADATA_PATH)?.filter_map(|entry| entry.ok())
         .collect();
-    paths.sort_by_key(|path| path.path());
-
+    paths.sort_by_key(|key| {
+        key.file_name()
+    });
     for path in paths {
         let file_name = path.file_name();
         let file = fs::read_to_string(path.path())?;
-        let file = file.as_str();
-        let value: Value = serde_json::from_str(file)?;
+        let value: Value = serde_json::from_str(&file)?;
         let pretty_name = file_name.to_str().unwrap_or("ERROR").replace(".json", "");
         println!("{}: {}
 {}:        {}
 Message:     {}
-----", "Snapshot ID".bright_cyan(), pretty_name,"Hash".bright_purple(), value["hash"], value["message"]);
+{}:       {}
+{}:    {}
+----", "Snapshot ID".bright_cyan(), pretty_name,"Hash".bright_purple(), value["hash"],value["message"],  "Email".green(), value["email"], "Username".yellow(), value["name"]);
         }
     
     Ok(())
 }
 /// основная функция.
 fn run() -> Result<(), std::io::Error>  {
-    
     let args: Vec<String> = std::env::args().collect();
     let version = || {println!("{} v{}. Licensed under MIT license", env!("CARGO_PKG_NAME").bright_green(), env!("CARGO_PKG_VERSION"))};
     let usage = || {println!(
 "Usage:
     mvc [-v | --version] <command> [<args>]
 Commands:
-    init              - initialize a new repository
-    log               - display all snapshots
-    return <id>       - returns to <id> version
-    save <message>    - saves version
-    help              - show this message")};
+    cfg <target> <data> - change data about you
+    init                - initialize a new repository
+    log                 - display all snapshots
+    return <id>         - returns to <id> version
+    save <message>      - saves version
+    help                - show this message")};
     if args.len() == 2 {
         if args[1] == "init" {
             init()?;
@@ -238,12 +349,17 @@ Commands:
         } else{usage()}
     } else if args.len() >= 3 {
         if args[1] == "return" {
-            return_to_snap(args[2].parse().unwrap())?;
+            let id:Option<u32>= args[2].parse().ok();
+            let id = id.ok_or_else(|| io::Error::new(io::ErrorKind::Other, "Failed to parse id"))?;
+            return_to_snap(id)?;
         } else if args[1] == "save" {
             save_snap(&args[2..].join(" "))?;   
+        }else if args.len() == 4 || args[1] == "cfg"{
+            config_user(&args[2], &args[3])?;
         } else {usage()} 
     } else {usage()}
     Ok(())
+    
 }
 fn main() {
     if let Err(e) = run() { // если Err(e) [(e это io::Error)] будет равен вызванной функции run()
